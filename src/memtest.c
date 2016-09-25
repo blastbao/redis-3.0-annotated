@@ -55,20 +55,36 @@
 
 static struct winsize ws;
 size_t progress_printed; /* Printed chars in screen-wide progress bar. */
-size_t progress_full; /* How many chars to write to fill the progress bar. */
+size_t progress_full;    /* How many chars to write to fill the progress bar. */
 
+
+/* 内存检测加载开始，输出开始的一些图线显示 */  
 void memtest_progress_start(char *title, int pass) {
     int j;
 
+    /*这里其实包含2个命令，"\xlb[H","xlb[2j",后面的命令是主要的操作 
+     *"\x1b" 是ESC的16进制ASCII码值，这里也可经表示成八进制的\033, 
+     *［是一个CSI(Control sequence introducer)，转义序列的作用由最后一个字符决定的， 
+     *这里J表示删除，默认情况下它删除从当前光标处到行尾的内容， 
+     *这里的2为参数，它表示删除所有的显示内容。也可以使用printf "\x1b[2J"。*/  
+    
+    //先定位home最开始的位置，然后实现清屏幕操作  
     printf("\x1b[H\x1b[2J");    /* Cursor home, clear screen. */
-    /* Fill with dots. */
-    for (j = 0; j < ws.ws_col*(ws.ws_row-2); j++) printf(".");
+
+    /* Fill with dots. */  
+    /* 输出.符号填充屏幕 */  
+    for (j = 0; j < ws.ws_col*(ws.ws_row-2); j++) 
+        printf(".");
+    
     printf("Please keep the test running several minutes per GB of memory.\n");
     printf("Also check http://www.memtest86.com/ and http://pyropus.ca/software/memtester/");
+    
+    //最后一个参数变了，为K，意义也不一样了变成删除当前行操作。
     printf("\x1b[H\x1b[2K");          /* Cursor home, clear current line.  */
     printf("%s [%d]\n", title, pass); /* Print title. */
     progress_printed = 0;
-    progress_full = ws.ws_col*(ws.ws_row-3);
+    //求出填满progress bar所需点的个数  
+    progress_full    = ws.ws_col*(ws.ws_row-3);
     fflush(stdout);
 }
 
@@ -88,15 +104,17 @@ void memtest_progress_step(size_t curr, size_t size, char c) {
  * address, and finally verified. This test is very fast but may detect
  * ASAP big issues with the memory subsystem. */
 void memtest_addressing(unsigned long *l, size_t bytes) {
+
     unsigned long words = bytes/sizeof(unsigned long);
     unsigned long j, *p;
 
     /* Fill */
     p = l;
-    for (j = 0; j < words; j++) {
+    for (j = 0; j < words; j++) { 
         *p = (unsigned long)p;
         p++;
-        if ((j & 0xffff) == 0) memtest_progress_step(j,words*2,'A');
+        if ((j & 0xffff) == 0) 
+            memtest_progress_step(j,words*2,'A');
     }
     /* Test */
     p = l;

@@ -31,10 +31,7 @@
 #ifndef __SDS_H
 #define __SDS_H
 
-/*
- * 最大预分配长度
- */
-#define SDS_MAX_PREALLOC (1024*1024)
+#define SDS_MAX_PREALLOC (1024*1024)    //字符串最大的预分配长度是1M
 
 #include <sys/types.h>
 #include <stdarg.h>
@@ -42,10 +39,10 @@
 /*
  * 类型别名，用于指向 sdshdr 的 buf 属性
  */
-typedef char *sds;
+typedef char *sds;  //sds本身被typedef为char*，是后续绝大部分函数的参数（之一）
 
 /*
- * 保存字符串对象的结构
+ * 保存字符串对象的数据结构，记录了字符串长度、空闲字节，以及指向实际存储数据buf的指针
  */
 struct sdshdr {
     

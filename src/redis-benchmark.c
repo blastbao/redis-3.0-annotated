@@ -49,15 +49,21 @@
 #define REDIS_NOTUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
 
+/* config配置信息结构体，static静态变量，使得全局只有一个 */
 static struct config {
+    //消息事件
     aeEventLoop *el;
     const char *hostip;
     int hostport;
+    //据此判断是否是本地测试
     const char *hostsocket;
+    //Client总数量
     int numclients;
     int liveclients;
+    //请求的总数
     int requests;
     int requests_issued;
+    //请求完成的总数
     int requests_finished;
     int keysize;
     int datasize;
@@ -69,36 +75,85 @@ static struct config {
     long long totlatency;
     long long *latency;
     const char *title;
+    //Client列表，这个在下面会经常提起
     list *clients;
     int quiet;
     int csv;
+    //判断是否loop循环处理
     int loop;
     int idlemode;
     int dbnum;
     sds dbnumstr;
     char *tests;
+    char *auth;
 } config;
 
+
+/*
+这里的Client和RedisClient不是一个东西，也就是说，这里的Client会
+根据config结构体中的配置做相应的操作。client根据获得到命令无非2
+种操作，read和Write,所以在后面的事件处理中也是针对这2种事件的处
+理。
+*/
 typedef struct _client {
+    //redis上下文
     redisContext *context;
+    //此缓冲区将用于后面的读写handler
     sds obuf;
+    
+    //rand指针数组
     char **randptr;         /* Pointers to :rand: strings inside the command buf */
+    //randptr中指针个数
     size_t randlen;         /* Number of pointers in client->randptr */
+    //randptr中没有被使用的指针个数
     size_t randfree;        /* Number of unused pointers in client->randptr */
+    
+
     unsigned int written;   /* Bytes of 'obuf' already written */
+    //请求的发起时间
     long long start;        /* Start time of a request */
+    //请求的延时
     long long latency;      /* Request latency */
+    //请求的等待个数
     int pending;            /* Number of pending requests (replies to consume) */
+    
     int selectlen;  /* If non-zero, a SELECT of 'selectlen' bytes is currently
                        used as a prefix of the pipline of commands. This gets
                        discarded the first time it's sent. */
 } *client;
 
 /* Prototypes */
-static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask);
-static void createMissingClients(client c);
-
+/* 方法原型 */
+static void createMissingClients(client c); /* 创建没有Command命令要求的clint */
+static long long ustime(void) /* 返回当期时间的单位为微秒的格式 */
+static long long mstime(void) /* 返回当期时间的单位为毫秒的格式 */
+static void freeClient(client c) /* 释放Client */
+static void freeAllClients(void) /* 释放所有的Client */
+static void resetClient(client c) /* 重置Client */
+static void randomizeClientKey(client c) /* 随机填充client里的randptr中的key值 */
+static void clientDone(client c) /* Client完成后的调用方法 */
+static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) /* 读事件的处理方法 */
+static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) /* 写事件方法处理 */
+static client createClient(char *cmd, size_t len, client from) /* 创建一个基准的Client */
+static int compareLatency(const void *a, const void *b) /* 比较延时 */
+static void showLatencyReport(void) /* 输出请求延时 */
+static void benchmark(char *title, char *cmd, int len) /* 对指定的CMD命令做性能测试 */
+int parseOptions(int argc, const char **argv) /* 根据读入的参数，设置config配置文件 */
+int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData) /* 显示Request执行的速度，简称RPS */
+int test_is_selected(char *name) /* 检测config中的命令是否被选中 */
+    
+/* 
+介绍一下struct timeval结构体
+struct timeval结构体在time.h中的定义为：
+struct timeval
+{
+  __time_t tv_sec;          // Seconds. 
+  __suseconds_t tv_usec;    // Microseconds. (微秒)
+}; 
+*/
+    
 /* Implementation */
+/* 返回当期时间的单位为微秒的格式 */
 static long long ustime(void) {
     struct timeval tv;
     long long ust;
@@ -109,6 +164,7 @@ static long long ustime(void) {
     return ust;
 }
 
+/* 返回当期时间的单位为毫秒的格式 */
 static long long mstime(void) {
     struct timeval tv;
     long long mst;
@@ -119,38 +175,51 @@ static long long mstime(void) {
     return mst;
 }
 
+/* 释放Client */
 static void freeClient(client c) {
     listNode *ln;
+    //删除文件的读写事件
     aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
     aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
+    //释放Client中所占的空间
     redisFree(c->context);
     sdsfree(c->obuf);
     zfree(c->randptr);
     zfree(c);
+    //减少配置结构体中liveclients存在的Client的数量
     config.liveclients--;
+    //寻找c对应的结点，在config中的Clients中删除此结点
     ln = listSearchKey(config.clients,c);
     assert(ln != NULL);
     listDelNode(config.clients,ln);
 }
 
+/* 释放所有的Client */
 static void freeAllClients(void) {
     listNode *ln = config.clients->head, *next;
 
     while(ln) {
+        //链表循环操作，释放空间
         next = ln->next;
         freeClient(ln->value);
         ln = next;
     }
 }
 
+/* 重置Client客户端 */
 static void resetClient(client c) {
+    //删除写事件
     aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+    //删除读事件
     aeDeleteFileEvent(config.el,c->context->fd,AE_READABLE);
+    //创建写事件，并且把写的处理事件函数当做参数往里面传入，又体现了函数编程的思想
     aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
     c->written = 0;
+    //pending的意思是客户端待处理的请求个数
     c->pending = config.pipeline;
 }
 
+/* 随机填充client里的randptr中的key值 */
 static void randomizeClientKey(client c) {
     size_t i;
 
@@ -167,15 +236,19 @@ static void randomizeClientKey(client c) {
     }
 }
 
+/* Client完成后的调用方法 */
 static void clientDone(client c) {
     if (config.requests_finished == config.requests) {
+        //请求如果全部完成，释放客户端
         freeClient(c);
         aeStop(config.el);
         return;
     }
     if (config.keepalive) {
+        //如果配置文件属性需要保持keepalive状态，则不释放客户端，直接重置
         resetClient(c);
     } else {
+        //其他情况，让活跃的Client数多1
         config.liveclients--;
         createMissingClients(c);
         config.liveclients++;
@@ -183,6 +256,7 @@ static void clientDone(client c) {
     }
 }
 
+/* 读事件的处理方法 */
 static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     void *reply = NULL;
@@ -193,9 +267,11 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     /* Calculate latency only for the first read event. This means that the
      * server already sent the reply and we need to parse it. Parsing overhead
      * is not part of the latency, so calculate it only once, here. */
+    //计算延时，然后比较延时，取得第一个read 的event事件
     if (c->latency < 0) c->latency = ustime()-(c->start);
 
     if (redisBufferRead(c->context) != REDIS_OK) {
+        //首先判断能否读
         fprintf(stderr,"Error: %s\n",c->context->errstr);
         exit(1);
     } else {
@@ -205,18 +281,20 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 exit(1);
             }
             if (reply != NULL) {
+                //获取reply回复，如果这里出错，也会直接退出
                 if (reply == (void*)REDIS_REPLY_ERROR) {
                     fprintf(stderr,"Unexpected error reply, exiting...\n");
                     exit(1);
                 }
 
                 freeReplyObject(reply);
-
+                    
                 if (c->selectlen) {
-                    int j;
+                    size_t j;
 
                     /* This is the OK from SELECT. Just discard the SELECT
                      * from the buffer. */
+                    //执行到这里，请求已经执行成功，等待的请求数减1
                     c->pending--;
                     sdsrange(c->obuf,c->selectlen,-1);
                     /* We also need to fix the pointers to the strings
@@ -231,6 +309,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                     config.latency[config.requests_finished++] = c->latency;
                 c->pending--;
                 if (c->pending == 0) {
+                    //调用客户端done完成后的方法
                     clientDone(c);
                     break;
                 }
@@ -241,6 +320,7 @@ static void readHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     }
 }
 
+/* 写事件的处理方法 */
 static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     client c = privdata;
     REDIS_NOTUSED(el);
@@ -263,6 +343,7 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     if (sdslen(c->obuf) > c->written) {
         void *ptr = c->obuf+c->written;
+        //调用写事件的关键
         int nwritten = write(c->context->fd,ptr,sdslen(c->obuf)-c->written);
         if (nwritten == -1) {
             if (errno != EPIPE)
@@ -272,7 +353,9 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
         c->written += nwritten;
         if (sdslen(c->obuf) == c->written) {
+            //写事件完成，删除写事件
             aeDeleteFileEvent(config.el,c->context->fd,AE_WRITABLE);
+            //创建读事件
             aeCreateFileEvent(config.el,c->context->fd,AE_READABLE,readHandler,c);
         }
     }
@@ -300,15 +383,20 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  *
  * Even when cloning another client, the SELECT command is automatically prefixed
  * if needed. */
+/* 创建一个基准的Client */
 static client createClient(char *cmd, size_t len, client from) {
     int j;
     client c = zmalloc(sizeof(struct _client));
 
     if (config.hostsocket == NULL) {
+        //指定，ip地址，端口号的测试
         c->context = redisConnectNonBlock(config.hostip,config.hostport);
     } else {
+        //本地host测试时
         c->context = redisConnectUnixNonBlock(config.hostsocket);
     }
+    
+    //判断连接是否成功
     if (c->context->err) {
         fprintf(stderr,"Could not connect to Redis at ");
         if (config.hostsocket == NULL)
@@ -324,6 +412,13 @@ static client createClient(char *cmd, size_t len, client from) {
      * Queue N requests accordingly to the pipeline size, or simply clone
      * the example client buffer. */
     c->obuf = sdsempty();
+
+    if (config.auth) {
+        char *buf = NULL;
+        int len = redisFormatCommand(&buf, "AUTH %s", config.auth);
+        c->obuf = sdscatlen(c->obuf, buf, len);
+        free(buf);
+    }
 
     /* If a DB number different than zero is selected, prefix our request
      * buffer with the SELECT command, that will be discarded the first
@@ -346,6 +441,7 @@ static client createClient(char *cmd, size_t len, client from) {
         for (j = 0; j < config.pipeline; j++)
             c->obuf = sdscatlen(c->obuf,cmd,len);
     }
+
     c->written = 0;
     c->pending = config.pipeline;
     c->randptr = NULL;
@@ -353,13 +449,14 @@ static client createClient(char *cmd, size_t len, client from) {
     if (c->selectlen) c->pending++;
 
     /* Find substrings in the output buffer that need to be randomized. */
+    //将from的一些属性赋值给新创建的client
     if (config.randomkeys) {
         if (from) {
             c->randlen = from->randlen;
             c->randfree = 0;
             c->randptr = zmalloc(sizeof(char*)*c->randlen);
             /* copy the offsets. */
-            for (j = 0; j < c->randlen; j++) {
+            for (j = 0; j < (int)c->randlen; j++) {
                 c->randptr[j] = c->obuf + (from->randptr[j]-from->obuf);
                 /* Adjust for the different select prefix length. */
                 c->randptr[j] += c->selectlen - from->selectlen;
@@ -381,25 +478,20 @@ static client createClient(char *cmd, size_t len, client from) {
             }
         }
     }
+    
+    //刚刚创建完客户端后，还不能支持读事件，所以只能先有写事件
     aeCreateFileEvent(config.el,c->context->fd,AE_WRITABLE,writeHandler,c);
     listAddNodeTail(config.clients,c);
     config.liveclients++;
     return c;
 }
 
+/* 创建没有Command命令要求的clint */
 static void createMissingClients(client c) {
     int n = 0;
-    char *buf = c->obuf;
-    size_t buflen = sdslen(c->obuf);
-
-    /* If we are cloning from a client with a SELECT prefix, skip it since the
-     * client will be created with the prefixed SELECT if needed. */
-    if (c->selectlen) {
-        buf += c->selectlen;
-        buflen -= c->selectlen;
-    }
 
     while(config.liveclients < config.numclients) {
+        //隔一段时间，增加活跃的Client数量
         createClient(NULL,0,c);
 
         /* Listen backlog is quite limited on most systems */
@@ -410,10 +502,12 @@ static void createMissingClients(client c) {
     }
 }
 
+/* 比较延时 */
 static int compareLatency(const void *a, const void *b) {
     return (*(long long*)a)-(*(long long*)b);
 }
 
+/* 输出请求延时 */
 static void showLatencyReport(void) {
     int i, curlat = 0;
     float perc, reqpersec;
@@ -428,6 +522,7 @@ static void showLatencyReport(void) {
         printf("  keep alive: %d\n", config.keepalive);
         printf("\n");
 
+        //将请求按延时排序
         qsort(config.latency,config.requests,sizeof(long long),compareLatency);
         for (i = 0; i < config.requests; i++) {
             if (config.latency[i]/1000 != curlat || i == (config.requests-1)) {
@@ -444,18 +539,21 @@ static void showLatencyReport(void) {
     }
 }
 
+/* 对指定的CMD命令做性能测试 */
 static void benchmark(char *title, char *cmd, int len) {
     client c;
 
-    config.title = title;
-    config.requests_issued = 0;
-    config.requests_finished = 0;
+    config.title                = title;
+    config.requests_issued      = 0;
+    config.requests_finished    = 0;
 
     c = createClient(cmd,len,NULL);
     createMissingClients(c);
 
     config.start = mstime();
     aeMain(config.el);
+    
+    //最后通过计算总延时，显示延时报告，体现性能测试的结果
     config.totlatency = mstime()-config.start;
 
     showLatencyReport();
@@ -463,6 +561,7 @@ static void benchmark(char *title, char *cmd, int len) {
 }
 
 /* Returns number of consumed options. */
+/* 根据读入的参数，设置config配置文件 */
 int parseOptions(int argc, const char **argv) {
     int i;
     int lastarg;
@@ -470,7 +569,8 @@ int parseOptions(int argc, const char **argv) {
 
     for (i = 1; i < argc; i++) {
         lastarg = (i == (argc-1));
-
+        
+        //通过多重if判断，但个人感觉不够优美，稳定性略差
         if (!strcmp(argv[i],"-c")) {
             if (lastarg) goto invalid;
             config.numclients = atoi(argv[++i]);
@@ -489,6 +589,9 @@ int parseOptions(int argc, const char **argv) {
         } else if (!strcmp(argv[i],"-s")) {
             if (lastarg) goto invalid;
             config.hostsocket = strdup(argv[++i]);
+        } else if (!strcmp(argv[i],"-a") ) {
+            if (lastarg) goto invalid;
+            config.auth = strdup(argv[++i]);
         } else if (!strcmp(argv[i],"-d")) {
             if (lastarg) goto invalid;
             config.datasize = atoi(argv[++i]);
@@ -542,14 +645,17 @@ int parseOptions(int argc, const char **argv) {
     return i;
 
 invalid:
+    //参数无效直接跳到goto语句处理了
     printf("Invalid option \"%s\" or option argument missing\n\n",argv[i]);
 
 usage:
+    //goto中提示信息的输出
     printf(
 "Usage: redis-benchmark [-h <host>] [-p <port>] [-c <clients>] [-n <requests]> [-k <boolean>]\n\n"
 " -h <hostname>      Server hostname (default 127.0.0.1)\n"
 " -p <port>          Server port (default 6379)\n"
 " -s <socket>        Server socket (overrides host and port)\n"
+" -a <password>      Password for Redis Auth\n"
 " -c <clients>       Number of parallel connections (default 50)\n"
 " -n <requests>      Total number of requests (default 10000)\n"
 " -d <size>          Data size of SET/GET value in bytes (default 2)\n"
@@ -587,12 +693,19 @@ usage:
     exit(exit_status);
 }
 
+/* 显示Request执行的速度，简称RPS */
 int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     REDIS_NOTUSED(eventLoop);
     REDIS_NOTUSED(id);
     REDIS_NOTUSED(clientData);
 
+    if (config.liveclients == 0) {
+        fprintf(stderr,"All clients disconnected... aborting.\n");
+        exit(1);
+    }
+
     if (config.csv) return 250;
+    //算出开始到现在的时间
     float dt = (float)(mstime()-config.start)/1000.0;
     float rps = (float)config.requests_finished/dt;
     printf("%s: %.2f\r", config.title, rps);
@@ -602,6 +715,7 @@ int showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData
 
 /* Return true if the named test was selected using the -t command line
  * switch, or if all the tests are selected (no -t passed by user). */
+/* 检测config中的命令是否被选中 */
 int test_is_selected(char *name) {
     char buf[256];
     int l = strlen(name);
@@ -614,6 +728,7 @@ int test_is_selected(char *name) {
     return strstr(config.tests,buf) != NULL;
 }
 
+/* 测试程序 */
 int main(int argc, const char **argv) {
     int i;
     char *data, *cmd;
@@ -624,7 +739,8 @@ int main(int argc, const char **argv) {
     srandom(time(NULL));
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
-
+    
+    //做config的默认配置
     config.numclients = 50;
     config.requests = 10000;
     config.liveclients = 0;
@@ -646,7 +762,9 @@ int main(int argc, const char **argv) {
     config.hostsocket = NULL;
     config.tests = NULL;
     config.dbnum = 0;
-
+    config.auth = NULL;
+    
+    //根据输入的参数配置
     i = parseOptions(argc,argv);
     argc -= i;
     argv += i;
@@ -675,6 +793,7 @@ int main(int argc, const char **argv) {
 
         do {
             len = redisFormatCommandArgv(&cmd,argc,argv,NULL);
+            //输入cmd操作命令进行测试
             benchmark(title,cmd,len);
             free(cmd);
         } while(config.loop);
@@ -687,7 +806,8 @@ int main(int argc, const char **argv) {
         data = zmalloc(config.datasize+1);
         memset(data,'x',config.datasize);
         data[config.datasize] = '\0';
-
+        
+        //下面是一些常用的命令的性能测试操作
         if (test_is_selected("ping_inline") || test_is_selected("ping"))
             benchmark("PING_INLINE","PING\r\n",6);
 

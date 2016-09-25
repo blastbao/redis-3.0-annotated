@@ -36,19 +36,36 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/* This is a really minimal testing framework for C.
+ *
+ * Example:
+ *
+ * test_cond("Check if 1 == 1", 1==1)
+ * test_cond("Check if 5 > 10", 5 > 10)
+ * test_report()
+ */
+
+
+
+
+
+
+
 #ifndef __TESTHELP_H
 #define __TESTHELP_H
 
-int __failed_tests = 0;
-int __test_num = 0;
+int __failed_tests = 0; 	//失败的测试用例数
+int __test_num = 0;			//总的测试用例数
+
 #define test_cond(descr,_c) do { \
     __test_num++; printf("%d - %s: ", __test_num, descr); \
     if(_c) printf("PASSED\n"); else {printf("FAILED\n"); __failed_tests++;} \
 } while(0);
+
 #define test_report() do { \
     printf("%d tests, %d passed, %d failed\n", __test_num, \
                     __test_num-__failed_tests, __failed_tests); \
-    if (__failed_tests) { \
+    if (__failed_tests) { \  //若已发生错误，在调用report时会终止
         printf("=== WARNING === We have failed tests here...\n"); \
         exit(1); \
     } \
